@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 class ChunkingMethods(Enum):
-    CHARACTER_SPLITER = "CHARACTER"
-    MARKDOWN_SPLITER = "MARKDOWN"
-    TOKEN_SPLITER = "TOKEN"
+    CHARACTER_SPLITTER = "CHARACTER"
+    MARKDOWN_SPLITTER = "MARKDOWN"
+    TOKEN_SPLITTER = "TOKEN"
 
 
 class RAG:
@@ -32,32 +32,28 @@ class RAG:
         self,
         chunk_size=2000,
         chunk_overlap=20,
-        chunking_method=ChunkingMethods.MARKDOWN_SPLITER.value,
+        chunking_method=ChunkingMethods.MARKDOWN_SPLITTER.value,
     ):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.chunking_method = chunking_method
 
     def chunking(self, data):
-        print(self.chunking_method)
-        if self.chunking_method == ChunkingMethods.MARKDOWN_SPLITER.value:
-            text_splitter = MarkdownTextSplitter(
-                chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap
-            )
-            return text_splitter.create_documents([data])
-        if self.chunking_method == ChunkingMethods.CHARACTER_SPLITER.value:
-            text_splitter = CharacterTextSplitter(
-                chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap
-            )
-            return text_splitter.create_documents([data])
-        if self.chunking_method == ChunkingMethods.TOKEN_SPLITER.value:
-            text_splitter = NLTKTextSplitter(
+        logger.info(f"Chunking data using method: {self.chunking_method}")
+        splitter_classes = {
+            ChunkingMethods.MARKDOWN_SPLITTER.value: MarkdownTextSplitter,
+            ChunkingMethods.CHARACTER_SPLITTER.value: CharacterTextSplitter,
+            ChunkingMethods.TOKEN_SPLITTER.value: NLTKTextSplitter,
+        }
+        splitter_class = splitter_classes.get(self.chunking_method)
+        if splitter_class:
+            text_splitter = splitter_class(
                 chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap
             )
             return text_splitter.create_documents([data])
 
-    def pre_retrieval_optimization(self, query):
-        pass
+        logger.error(f"Invalid chunking method: {self.chunking_method}")
+        return []
 
 
 class PGDatabase:
@@ -88,7 +84,7 @@ class PGDatabase:
 
     def connect_db(self, db_url):
         try:
-            logger.info(f"Connecting to database with URL: {db_url}")
+            logger.info("Connecting to database")
             conn = psycopg2.connect(db_url)
             logger.info("Database connection established")
             return conn
@@ -113,25 +109,16 @@ class PGDatabase:
         try:
             logger.info(f"Creating table {self.table_name} if not exists")
             with self.conn.cursor() as cur:
-                if self.openai_key:
-                    cur.execute(f"""
-                        CREATE TABLE IF NOT EXISTS {self.table_name} (
-                            id SERIAL PRIMARY KEY,
-                            title TEXT,
-                            content TEXT,
-                            uniqueid TEXT,
-                        );
-                    """)
-                else:
-                    cur.execute(f"""
+                table_creation_query = f"""
                     CREATE TABLE IF NOT EXISTS {self.table_name} (
                         id SERIAL PRIMARY KEY,
                         title TEXT,
                         content TEXT,
                         uniqueid TEXT,
-                        embedding VECTOR(768)
+                        {'' if self.openai_key else 'embedding VECTOR(768)'}
                     );
-                """)
+                """
+                cur.execute(table_creation_query)
                 self.conn.commit()
             logger.info(f"Table {self.table_name} created successfully")
         except psycopg2.DatabaseError as e:
@@ -140,7 +127,6 @@ class PGDatabase:
     def insert_data(self, data):
         try:
             logger.info(f"Inserting data into table {self.table_name}")
-
             with self.conn.cursor() as cur:
                 cur.execute(
                     f"SELECT 1 FROM {self.table_name} WHERE uniqueid = %s",
@@ -154,13 +140,12 @@ class PGDatabase:
 
                 if not self.openai_key:
                     docs = self.rag.chunking(data["content"])
-
                     logger.info(f"Split content into {len(docs)} chunks")
-
                     for doc in docs:
                         data["embedding"] = self.ollama.embeddings(
                             model=self.embedding_model, prompt=doc.page_content
                         )["embedding"]
+                        
                         cur.execute(
                             f"""
                             INSERT INTO {self.table_name} (title, uniqueid, content, embedding) 
@@ -176,14 +161,10 @@ class PGDatabase:
                 else:
                     cur.execute(
                         f"""
-                            INSERT INTO {self.table_name} (title, uniqueid, content) 
-                            VALUES (%s, %s, %s)
-                        """,
-                        (
-                            data["title"],
-                            data["uniqueid"],
-                            data["content"],
-                        ),
+                        INSERT INTO {self.table_name} (title, uniqueid, content) 
+                        VALUES (%s, %s, %s)
+                    """,
+                        (data["title"], data["uniqueid"], data["content"]),
                     )
                     cur.execute(f"""
                         SELECT ai.create_vectorizer(
@@ -216,7 +197,6 @@ class PGDatabase:
     def retrieve_and_generate_response(self, query, limit=2):
         try:
             logger.info(f"Retrieving and generating response for query: {query}")
-
             with self.conn.cursor() as cur:
                 query_embedding = self.get_query_embedding(query, cur)
                 cur.execute(
@@ -228,16 +208,12 @@ class PGDatabase:
                 """,
                     (query_embedding, limit),
                 )
-
                 rows = cur.fetchall()
-
                 logger.info(f"Top {limit} similar rows: {rows}")
-
                 context = "\n\n".join(
                     [f"Title: {row[0]}\n Content: {row[1]}" for row in rows]
                 )
                 response = self.generate_response(query, context, cur)
-
                 logger.info(f"Generated response: {response}")
                 return response
         except psycopg2.DatabaseError as e:
@@ -253,24 +229,19 @@ class PGDatabase:
 
     def generate_response(self, query, context, cur):
         prompt = f"Query: {query} \n Context: {context} \n NOTE: !! Only return answer for the query !!"
-
         if self.is_db_running_local:
             cur.execute(
                 f"SELECT ai.ollama_generate('{self.completion_model}', %s);", (prompt,)
             )
             return cur.fetchone()["response"]
-
         return self.ollama.chat(
             model=self.completion_model,
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a friendly chatbot that always answers questions based on the provided context. If the context is insufficient to answer a question, please respond by saying, 'I don't have enough context to answer this question.",
+                    "content": "You are a friendly chatbot that always answers questions based on the provided context. If the context is insufficient to answer a question, please respond by saying, 'I don't have enough context to answer this question.'",
                 },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
+                {"role": "user", "content": prompt},
             ],
         )["message"]["content"]
 
@@ -290,10 +261,7 @@ class PGDatabase:
 
 
 class PGVector:
-    def __init__(
-        self,
-        pg_database,
-    ):
+    def __init__(self, pg_database):
         self.db = pg_database
         self.db.create_table()
 
@@ -310,9 +278,7 @@ class PGVector:
                 },
             )
             response.raise_for_status()
-
             response = response.json()
-
             if response and response["code"] == 200 and response["data"]:
                 logger.info("Data fetched successfully from website")
                 return {
@@ -343,87 +309,32 @@ class PGVector:
 class ChatApp:
     def __init__(self):
         self.db_url = st.sidebar.text_input("Enter PGVector DB URL")
-        
         self.chat_mode = st.sidebar.selectbox(
             "Select Chat Mode", ["Chat with Website", "Chat with File"]
         )
         self.llm_choice = st.sidebar.selectbox("Select LLM", ["OpenAI", "OLLAMA"])
-
         self.embedding_model = self.get_embedding_model()
         self.completion_model = self.get_completion_model()
-
         self.openai_key = None
-
         self.ollama_host = None
         self.ollama = None
-      
 
         st.session_state.isWebsiteAdded = (
             False
             if "isWebsiteAdded" not in st.session_state
             else st.session_state.get("isWebsiteAdded")
         )
-
-        self.isWebsiteAdded = st.session_state.get("isWebsiteAdded")
+        self.isWebsiteAdded = st.session_state.isWebsiteAdded
 
         if self.llm_choice == "OpenAI":
             self.openai_key = st.sidebar.text_input("Enter OpenAI Key", type="password")
         elif self.llm_choice == "OLLAMA":
-            self.ollama_host =  st.sidebar.text_input("Enter OLLAMA Host URL")
+            self.ollama_host = st.sidebar.text_input("Enter OLLAMA Host URL")
+            print(self.ollama_host,"ollam")
             self.ollama = Client(host=self.ollama_host)
-            if "chunk_size" not in st.session_state:
-                st.session_state.chunk_size = 2000
-            if "chunk_overlap" not in st.session_state:
-                st.session_state.chunk_overlap = 20
-            if "chunking_method" not in st.session_state:
-                st.session_state.chunking_method = (
-                    ChunkingMethods.MARKDOWN_SPLITER.value
-                )
+            self.initialize_chunking_settings()
 
-            self.chunk_size = st.sidebar.number_input(
-                "Set chunk size",
-                min_value=100,
-                value=st.session_state.chunk_size,
-                max_value=10000,
-                on_change=lambda: st.session_state.update(
-                    {"chunk_size": self.chunk_size}
-                ),
-            )
-            st.session_state.chunk_size = self.chunk_size
-
-            self.chunk_overlap = st.sidebar.number_input(
-                "Set chunk overlap",
-                min_value=0,
-                value=st.session_state.chunk_overlap,
-                max_value=100,
-                on_change=lambda: st.session_state.update(
-                    {"chunk_overlap": self.chunk_overlap}
-                ),
-            )
-
-            st.session_state.chunk_overlap = self.chunk_overlap
-
-            self.chunking_method = st.sidebar.selectbox(
-                "Select chunking method",
-                [
-                    ChunkingMethods.MARKDOWN_SPLITER.value,
-                    ChunkingMethods.CHARACTER_SPLITER.value,
-                    ChunkingMethods.TOKEN_SPLITER.value,
-                ],
-                index=[
-                    ChunkingMethods.MARKDOWN_SPLITER.value,
-                    ChunkingMethods.CHARACTER_SPLITER.value,
-                    ChunkingMethods.TOKEN_SPLITER.value,
-                ].index(st.session_state.chunking_method),
-                on_change=lambda: st.session_state.update(
-                    {"chunking_method": self.chunking_method}
-                ),
-            )
-            st.session_state.chunking_method = self.chunking_method
-
-        if "reterival_limit" not in st.session_state:
-            st.session_state.reterival_limit = 3
-
+        st.session_state.reterival_limit = st.session_state.get("reterival_limit", 3)
         self.reterival_limit = st.sidebar.number_input(
             "Set number of doc to retrieve",
             min_value=1,
@@ -432,7 +343,6 @@ class ChatApp:
         )
         self.initialize_session_state()
 
-        # Add a button to clear all data in the database
         if st.sidebar.button("Clear All Data IN DB"):
             self.clear_all_data()
 
@@ -448,9 +358,47 @@ class ChatApp:
     def get_completion_model(self):
         if self.llm_choice == "OLLAMA":
             return st.sidebar.selectbox(
-                "Select Completion Model",
-                ["tinyllama", "llama3", "mistral", "phi3.5"],
+                "Select Completion Model", ["tinyllama", "llama3", "mistral", "phi3.5"]
             )
+
+    def initialize_chunking_settings(self):
+        st.session_state.chunk_size = st.session_state.get("chunk_size", 2000)
+        st.session_state.chunk_overlap = st.session_state.get("chunk_overlap", 20)
+        st.session_state.chunking_method = st.session_state.get(
+            "chunking_method", ChunkingMethods.MARKDOWN_SPLITTER.value
+        )
+
+        self.chunk_size = st.sidebar.number_input(
+            "Set chunk size",
+            min_value=100,
+            value=st.session_state.chunk_size,
+            max_value=10000,
+            on_change=self.update_chunk_size,
+        )
+        self.chunk_overlap = st.sidebar.number_input(
+            "Set chunk overlap",
+            min_value=0,
+            value=st.session_state.chunk_overlap,
+            max_value=100,
+            on_change=self.update_chunk_overlap,
+        )
+        self.chunking_method = st.sidebar.selectbox(
+            "Select chunking method",
+            [method.value for method in ChunkingMethods],
+            index=[method.value for method in ChunkingMethods].index(
+                st.session_state.chunking_method
+            ),
+            on_change=self.update_chunking_method,
+        )
+
+    def update_chunk_size(self):
+        st.session_state.chunk_size = self.chunk_size
+
+    def update_chunk_overlap(self):
+        st.session_state.chunk_overlap = self.chunk_overlap
+
+    def update_chunking_method(self):
+        st.session_state.chunking_method = self.chunking_method
 
     def initialize_session_state(self):
         if "chat_with_website_history" not in st.session_state:
@@ -480,7 +428,6 @@ class ChatApp:
     def clear_all_data(self):
         if "pg_vector" in st.session_state:
             st.session_state.pg_vector.db.clean_table()
-
         st.session_state.chat_with_website_history = [
             {
                 "role": "assistant",
@@ -563,22 +510,19 @@ class ChatApp:
                                 "Invalid URL or unable to fetch content."
                             )
                         return
-            # print(st.session_state.isWebsiteAdded, "isWebsiteAdded")
 
             if st.session_state.isWebsiteAdded:
                 with st.spinner("Assistant is generating a response..."):
                     logger.info(f"Generating response for prompt: {prompt}")
-
                     response = pg_vector.db.retrieve_and_generate_response(
                         prompt, self.reterival_limit
                     )
             else:
-                response = "Please provide a website link with (https://.. or http://) to start the chat with it."
+                response = "Please provide a website link with protocol (https://.. or http://) to start the chat with it."
 
             st.session_state.chat_with_website_history.append(
                 {"role": "assistant", "content": response}
             )
-
             st.chat_message("assistant").write(response)
 
     def handle_chat_with_file(self):
@@ -589,6 +533,9 @@ class ChatApp:
 
         if uploaded_file is not None:
             logger.info(f"File uploaded: {uploaded_file.name} {uploaded_file.type}")
+
+            # Clear the old chat history when a new file is uploaded
+            st.session_state.chat_with_file_history = []
 
             file_content = StringIO(uploaded_file.getvalue().decode("utf-8")).read()
 
@@ -611,18 +558,16 @@ class ChatApp:
                 )
                 st.session_state.pg_vector = PGVector(pg_database)
             pg_vector = st.session_state.pg_vector
-            # print(file_content, "file_content")
-            pg_vector.db.insert_data(
-                {
-                    "content": file_content,
-                    "title": uploaded_file.name,
-                    "uniqueid": uploaded_file.name,
-                }
-            )
-            logger.info("File content inserted into database")
 
-            if "chat_with_file_history" not in st.session_state:
-                st.session_state["chat_with_file_history"] = []
+            with st.spinner("Indexing the file content..."):
+                pg_vector.db.insert_data(
+                    {
+                        "content": file_content,
+                        "title": uploaded_file.name,
+                        "uniqueid": uploaded_file.name,
+                    }
+                )
+            logger.info("File content inserted into database")
 
             for msg in st.session_state.chat_with_file_history:
                 st.chat_message(msg["role"]).write(msg["content"])
