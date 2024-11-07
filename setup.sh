@@ -1,0 +1,1 @@
+apt-get install libpq-dev python-dev && pip install psycopg2-binary
