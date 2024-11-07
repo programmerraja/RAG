@@ -1,0 +1,7 @@
+pydantic
+youtube_transcript_api
+nltk
+psycopg2
+streamlit
+ollama
+langchain
