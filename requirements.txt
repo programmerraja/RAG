@@ -1,6 +1,7 @@
 pydantic
 youtube_transcript_api
 nltk
+psycopg2-binary
 psycopg2
 streamlit
 ollama
