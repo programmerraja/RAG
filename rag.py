@@ -1,8 +1,11 @@
 import logging
+import random
 import re
 from enum import Enum
 from io import StringIO
+import time
 
+from bs4 import BeautifulSoup
 import psycopg2
 import requests
 import streamlit as st
@@ -145,7 +148,7 @@ class PGDatabase:
                         data["embedding"] = self.ollama.embeddings(
                             model=self.embedding_model, prompt=doc.page_content
                         )["embedding"]
-                        
+
                         cur.execute(
                             f"""
                             INSERT INTO {self.table_name} (title, uniqueid, content, embedding) 
@@ -214,7 +217,7 @@ class PGDatabase:
                     [f"Title: {row[0]}\n Content: {row[1]}" for row in rows]
                 )
                 response = self.generate_response(query, context, cur)
-                logger.info(f"Generated response: {response}")
+                # logger.info(f"Generated response: {response}")
                 return response
         except psycopg2.DatabaseError as e:
             logger.error(f"Error retrieving and generating response: {e}")
@@ -228,13 +231,17 @@ class PGDatabase:
         return cur.fetchone()
 
     def generate_response(self, query, context, cur):
-        prompt = f"Query: {query} \n Context: {context} \n NOTE: !! Only return answer for the query !!"
+        prompt = f"Query: {query} \n Context: {context}"
+
         if self.is_db_running_local:
             cur.execute(
                 f"SELECT ai.ollama_generate('{self.completion_model}', %s);", (prompt,)
             )
-            return cur.fetchone()["response"]
-        return self.ollama.chat(
+            response = cur.fetchone()["response"]
+            st.write(response)
+            return response
+
+        response_stream = self.ollama.chat(
             model=self.completion_model,
             messages=[
                 {
@@ -243,7 +250,14 @@ class PGDatabase:
                 },
                 {"role": "user", "content": prompt},
             ],
-        )["message"]["content"]
+            stream=True,
+        )
+
+        return st.write_stream(self.stream_to_string(response_stream))
+
+    def stream_to_string(self, response_stream):
+        for message in response_stream:
+            yield message["message"]["content"]
 
     def clean_table(self):
         try:
@@ -305,26 +319,60 @@ class PGVector:
             logger.error(f"Error fetching transcript from YouTube: {e}")
         return None
 
+    def fetch_articles_from_devto(self, username):
+        try:
+            logger.info(f"Fetching articles from dev.to for user: {username}")
+            response = requests.get(f"https://dev.to/api/articles?username={username}")
+            response.raise_for_status()
+            articles = response.json()
+            if articles:
+                logger.info(
+                    f"Total {len(articles)} articles from dev.to for user: {username}"
+                )
+                articles_data = []
+                for article in articles:
+                    articles_data.append(self.fetch_data_from_website(article["url"]))
+                return articles_data
+        except requests.RequestException as e:
+            logger.error(f"Error fetching articles from dev.to: {e}")
+        return None
+
 
 class ChatApp:
     def __init__(self):
-        self.db_url = st.sidebar.text_input("Enter PGVector DB URL")
         self.chat_mode = st.sidebar.selectbox(
-            "Select Chat Mode", ["Chat with Website", "Chat with File"]
+            "Select Chat Mode",
+            ["Chat with Website", "Chat with File", "Chat with your Dev.to articles"],
         )
+        self.db_url = st.sidebar.text_input("Enter PGVector DB URL")
+
         self.llm_choice = st.sidebar.selectbox("Select LLM", ["OpenAI", "OLLAMA"])
+
         self.embedding_model = self.get_embedding_model()
         self.completion_model = self.get_completion_model()
         self.openai_key = None
         self.ollama_host = None
         self.ollama = None
 
+        st.session_state.is_block = (
+            False
+            if "is_block" not in st.session_state
+            else st.session_state.get("is_block")
+        )
+
+        st.session_state.devto_username = (
+            None
+            if "devto_username" not in st.session_state
+            else st.session_state.get("devto_username")
+        )
+
         st.session_state.isWebsiteAdded = (
             False
             if "isWebsiteAdded" not in st.session_state
             else st.session_state.get("isWebsiteAdded")
         )
-        self.isWebsiteAdded = st.session_state.isWebsiteAdded
+
+        self.is_block = st.session_state.is_block
 
         if self.llm_choice == "OpenAI":
             self.openai_key = st.sidebar.text_input("Enter OpenAI Key", type="password")
@@ -410,6 +458,13 @@ class ChatApp:
             ]
         if "chat_with_file_history" not in st.session_state:
             st.session_state.chat_with_file_history = []
+        if "chat_with_devto_history" not in st.session_state:
+            st.session_state.chat_with_devto_history = [
+                {
+                    "role": "assistant",
+                    "content": "Please provide a dev.to username to start the chat with their articles.",
+                }
+            ]
 
     def check_llm_config(self):
         logger.info("Checking LLM configuration")
@@ -435,7 +490,17 @@ class ChatApp:
             }
         ]
         st.session_state.chat_with_file_history = []
+        st.session_state.chat_with_devto_history = [
+            {
+                "role": "assistant",
+                "content": "Please provide a dev.to username to start the chat with their articles.",
+            }
+        ]
+        st.session_state.is_block = False
+        st.session_state.devto_username = None
+        st.session_state.file_content = None
         st.session_state.isWebsiteAdded = False
+
         st.success("All data cleared successfully.")
 
     def handle_chat_with_website(self):
@@ -448,7 +513,7 @@ class ChatApp:
         for msg in st.session_state.chat_with_website_history:
             st.chat_message(msg["role"]).write(msg["content"])
 
-        if prompt := st.chat_input():
+        if prompt := st.chat_input(disabled=st.session_state.get("is_block", False)):
             st.session_state.chat_with_website_history.append(
                 {"role": "user", "content": prompt}
             )
@@ -472,14 +537,13 @@ class ChatApp:
             pg_vector = st.session_state.pg_vector
 
             if prompt == "clear":
-                pg_vector.db.clean_table()
-                st.session_state.chat_with_website_history = []
-                st.session_state.isWebsiteAdded = False
+                self.clear_all_data()
                 return
 
             if url_pattern.match(prompt):
                 if youtube_pattern.match(prompt):
                     with st.spinner("Fetching YouTube transcript..."):
+                        st.session_state.is_block = True
                         logger.info(f"Fetching YouTube transcript for URL: {prompt}")
                         youtube_content = pg_vector.fetch_transcript_from_youtube(
                             prompt
@@ -489,14 +553,16 @@ class ChatApp:
                             st.chat_message("assistant").write(
                                 "Transcript fetched and indexed. You can now start chatting."
                             )
-                            st.session_state.isWebsiteAdded = True
+                            st.session_state.is_block = False
                         else:
                             st.chat_message("assistant").write(
                                 "Unable to fetch the transcript."
                             )
+                        st.session_state.is_block = False
                         return
                 else:
                     with st.spinner("Indexing the website content..."):
+                        st.session_state.is_block = True
                         logger.info(f"Indexing website content for URL: {prompt}")
                         website_content = pg_vector.fetch_data_from_website(prompt)
                         if website_content:
@@ -504,26 +570,31 @@ class ChatApp:
                             st.chat_message("assistant").write(
                                 "Indexing completed. You can now start chatting."
                             )
+                            st.session_state.is_block = False
                             st.session_state.isWebsiteAdded = True
                         else:
                             st.chat_message("assistant").write(
                                 "Invalid URL or unable to fetch content."
                             )
+                        st.session_state.is_block = False
+
                         return
-
+            print("isWebsiteAdded", st.session_state.isWebsiteAdded)
             if st.session_state.isWebsiteAdded:
-                with st.spinner("Assistant is generating a response..."):
+                with st.chat_message("assistant"):
                     logger.info(f"Generating response for prompt: {prompt}")
-                    response = pg_vector.db.retrieve_and_generate_response(
-                        prompt, self.reterival_limit
-                    )
+                    with st.spinner(""):
+                        response = pg_vector.db.retrieve_and_generate_response(
+                            prompt, self.reterival_limit
+                        )
+                    if response:
+                        st.session_state.chat_with_website_history.append(
+                            {"role": "assistant", "content": response}
+                        )
             else:
-                response = "Please provide a website link with protocol (https://.. or http://) to start the chat with it."
-
-            st.session_state.chat_with_website_history.append(
-                {"role": "assistant", "content": response}
-            )
-            st.chat_message("assistant").write(response)
+                st.chat_message("assistant").write(
+                    "Please provide a website link with protocol (https://.. or http://) to start the chat with it."
+                )
 
     def handle_chat_with_file(self):
         st.title("Chat with File")
@@ -560,6 +631,7 @@ class ChatApp:
             pg_vector = st.session_state.pg_vector
 
             with st.spinner("Indexing the file content..."):
+                st.session_state.is_block = True
                 pg_vector.db.insert_data(
                     {
                         "content": file_content,
@@ -567,43 +639,137 @@ class ChatApp:
                         "uniqueid": uploaded_file.name,
                     }
                 )
+                st.session_state.is_block = False
             logger.info("File content inserted into database")
 
             for msg in st.session_state.chat_with_file_history:
                 st.chat_message(msg["role"]).write(msg["content"])
 
-            if prompt := st.chat_input():
+            if prompt := st.chat_input(
+                disabled=st.session_state.get("is_block", False)
+            ):
                 st.session_state.chat_with_file_history.append(
                     {"role": "user", "content": prompt}
                 )
                 st.chat_message("user").write(prompt)
 
                 if prompt == "clear":
-                    logger.info("Clearing chat history and database tables")
-                    pg_vector.db.clean_table()
-                    st.session_state.chat_with_file_history = []
+                    self.clear_all_data()
                     return
 
-                with st.spinner("Assistant is generating a response..."):
-                    response = pg_vector.db.retrieve_and_generate_response(
-                        prompt, self.reterival_limit
+                with st.chat_message("assistant"):
+                    with st.spinner(""):
+                        response = pg_vector.db.retrieve_and_generate_response(
+                            prompt, self.reterival_limit
+                        )
+                if response:
+                    st.session_state.chat_with_file_history.append(
+                        {"role": "assistant", "content": response}
                     )
-
-                st.session_state.chat_with_file_history.append(
-                    {"role": "assistant", "content": response}
-                )
-                st.chat_message("assistant").write(response)
         else:
             st.write("Please upload a file to start the conversation.")
             logger.warning("No file uploaded for chat")
+
+    def handle_chat_with_devto(self):
+        st.title("Chat with your Dev.to articles")
+        st.write(
+            "Enter a dev.to username to begin a conversation based on their articles."
+        )
+
+        for msg in st.session_state.chat_with_devto_history:
+            st.chat_message(msg["role"]).write(msg["content"])
+        if prompt := st.chat_input(
+            key="chat_with_dev_to", disabled=st.session_state.get("is_block", False)
+        ):
+            if not st.session_state.devto_username:
+                st.session_state.chat_with_devto_history.append(
+                    {"role": "user", "content": prompt}
+                )
+                st.chat_message("user").write(prompt)
+
+                if not self.check_llm_config():
+                    return
+                st.session_state.is_block = True
+                if "pg_vector" not in st.session_state:
+                    pg_database = PGDatabase(
+                        table_name="chat_with_devto",
+                        db_url=self.db_url,
+                        ollama=self.ollama,
+                        ollama_host=self.ollama_host,
+                        openai_key=self.openai_key,
+                        embedding_model=self.embedding_model,
+                        completion_model=self.completion_model,
+                        rag=RAG(
+                            self.chunk_size, self.chunk_overlap, self.chunking_method
+                        ),
+                    )
+                    st.session_state.pg_vector = PGVector(pg_database)
+
+                pg_vector = st.session_state.pg_vector
+
+                progress_bar = st.progress(1)
+                progress_text = st.empty()
+                progress_text.text(f"Fetching and indexing articles from user {prompt}")
+                articles = pg_vector.fetch_articles_from_devto(prompt)
+                if articles:
+                    for i, article in enumerate(articles):
+                        pg_vector.db.insert_data(article)
+                        progress_bar.progress((i + 1) / len(articles))
+                    progress_bar.empty()
+                    progress_text.empty()
+                    st.write(
+                        "Articles fetched and indexed successfully! you can start chating with your articel"
+                    )
+                    st.session_state.is_block = False
+                    st.session_state.devto_username = prompt
+                else:
+                    progress_bar.empty()
+                    progress_text.empty()
+                    st.write(
+                        "Unable to fetch articles for the provided valid username. or no articles found"
+                    )
+                    st.session_state.is_block = False
+                    return
+                st.session_state.is_block = False
+
+            elif st.session_state.devto_username:
+                pg_vector = st.session_state.pg_vector
+                st.session_state.chat_with_devto_history.append(
+                    {"role": "user", "content": prompt}
+                )
+                st.chat_message("user").write(prompt)
+
+                if prompt == "clear":
+                    self.clear_all_data()
+                    return
+
+                with st.chat_message("assistant"):
+                    with st.spinner(""):
+                        response = pg_vector.db.retrieve_and_generate_response(
+                            prompt, self.reterival_limit
+                        )
+                if response:
+                    st.session_state.chat_with_devto_history.append(
+                        {"role": "assistant", "content": response}
+                    )
+            else:
+                st.write("Please enter a dev.to username to start the conversation.")
+                logger.warning("No dev.to username provided for chat")
 
     def run(self):
         if self.chat_mode == "Chat with Website":
             self.handle_chat_with_website()
         elif self.chat_mode == "Chat with File":
             self.handle_chat_with_file()
+        elif self.chat_mode == "Chat with your Dev.to articles":
+            self.handle_chat_with_devto()
 
 
 if __name__ == "__main__":
     chat_app = ChatApp()
     chat_app.run()
+
+
+# TODO
+# search with keyword etc
+# stuffbreaker
