@@ -1,7 +1,7 @@
-import logging
-import re
+import os, re, logging
 from enum import Enum
 from io import StringIO
+import asyncio
 
 import psycopg2
 import requests
@@ -83,8 +83,6 @@ class PGDatabase:
         ollama=None,
         ollama_host=None,
         openai_key=None,
-        embedding_model="nomic-embed-text",
-        completion_model="tinyllama",
         rag=None,
     ):
         self.conn = self.connect_db(db_url)
@@ -96,8 +94,6 @@ class PGDatabase:
         self.ollama = ollama
         self.ollama_host = ollama_host
         self.openai_key = openai_key
-        self.embedding_model = embedding_model
-        self.completion_model = completion_model
         self.rag = rag
 
         if ollama:
@@ -164,7 +160,8 @@ class PGDatabase:
                     logger.info(f"Split content into {len(docs)} chunks")
                     for doc in docs:
                         data["embedding"] = self.ollama.embeddings(
-                            model=self.embedding_model, prompt=doc.get_content()
+                            model=st.session_state.embedding_model,
+                            prompt=doc.get_content(),
                         )["embedding"]
 
                         cur.execute(
@@ -191,7 +188,7 @@ class PGDatabase:
                         SELECT ai.create_vectorizer(
                             '{self.table_name}'::regclass,
                             destination => '{self.embedding_table_name}',
-                            embedding => ai.embedding_openai('{self.embedding_model}', 768),
+                            embedding => ai.embedding_openai('{st.session_state.embedding_model}', 768),
                             chunking => ai.chunking_recursive_character_text_splitter('content')
                         );
                     """)
@@ -241,10 +238,13 @@ class PGDatabase:
 
     def get_query_embedding(self, query, cur):
         if not self.is_db_running_local:
-            return self.ollama.embeddings(model=self.embedding_model, prompt=query)[
-                "embedding"
-            ]
-        cur.execute(f"SELECT ai.ollama_embed('{self.embedding_model}', %s);", (query,))
+            return self.ollama.embeddings(
+                model=st.session_state.embedding_model, prompt=query
+            )["embedding"]
+        cur.execute(
+            f"SELECT ai.ollama_embed('{st.session_state.embedding_model}', %s);",
+            (query,),
+        )
         return cur.fetchone()
 
     def generate_response(self, query, context, cur):
@@ -252,14 +252,15 @@ class PGDatabase:
 
         if self.is_db_running_local:
             cur.execute(
-                f"SELECT ai.ollama_generate('{self.completion_model}', %s);", (prompt,)
+                f"SELECT ai.ollama_generate('{st.session_state.completion_model}', %s);",
+                (prompt,),
             )
             response = cur.fetchone()["response"]
             st.write(response)
             return response
 
         response_stream = self.ollama.chat(
-            model=self.completion_model,
+            model=st.session_state.completion_model,
             messages=[
                 {
                     "role": "system",
@@ -347,8 +348,15 @@ class PGVector:
                     f"Total {len(articles)} articles from dev.to for user: {username}"
                 )
                 articles_data = []
-                for article in articles:
-                    articles_data.append(self.fetch_data_from_website(article["url"]))
+
+                async def fetch_article_data(article_url):
+                    return self.fetch_data_from_website(article_url)
+
+                async def fetch_all_articles():
+                    tasks = [fetch_article_data(article["url"]) for article in articles]
+                    return await asyncio.gather(*tasks)
+
+                articles_data = asyncio.run(fetch_all_articles())
                 return articles_data
         except requests.RequestException as e:
             logger.error(f"Error fetching articles from dev.to: {e}")
@@ -361,13 +369,12 @@ class ChatApp:
             "Chat Mode",
             ["Chat with Website", "Chat with File", "Chat with your Dev.to articles"],
         )
-        self.db_url = st.sidebar.text_input("PGVector DB URL")
+        # self.db_url = st.sidebar.text_input("PGVector DB URL")
 
-        self.llm_choice = st.sidebar.selectbox("LLM Provider", ["OpenAI", "OLLAMA"])
+        self.llm_choice = st.sidebar.selectbox("LLM Provider", ["OLLAMA", "OPENAI"])
 
-        self.embedding_model = self.get_embedding_model()
-        st.session_state.embedding_model = self.embedding_model
-        self.completion_model = self.get_completion_model()
+        st.session_state.embedding_model = self.get_embedding_model()
+        st.session_state.completion_model = self.get_completion_model()
         self.openai_key = None
         self.ollama_host = None
         self.ollama = None
@@ -390,18 +397,16 @@ class ChatApp:
             else st.session_state.get("isWebsiteAdded")
         )
 
-        self.is_block = st.session_state.is_block
-
         if self.llm_choice == "OpenAI":
             self.openai_key = st.sidebar.text_input("OpenAI Key", type="password")
         elif self.llm_choice == "OLLAMA":
-            self.ollama_host = st.sidebar.text_input("OLLAMA Host URL")
+            self.ollama_host = st.sidebar.text_input("OLLAMA Host URL", type="password")
             self.ollama = Client(host=self.ollama_host)
             st.session_state.ollama_host = self.ollama_host
             self.initialize_chunking_settings()
 
         st.session_state.reterival_limit = st.session_state.get("reterival_limit", 3)
-        
+
         self.reterival_limit = st.sidebar.number_input(
             "Number of documents to retrieve",
             min_value=1,
@@ -415,6 +420,8 @@ class ChatApp:
 
     def get_embedding_model(self):
         if self.llm_choice == "OpenAI":
+            # if provider change we need start again because  openAI using different indexing technique
+            self.clear_all_data()
             return st.sidebar.selectbox(
                 "Embedding Model",
                 ["text-embedding-3-small", "text-embedding-3-large"],
@@ -486,7 +493,7 @@ class ChatApp:
         elif self.llm_choice == "OLLAMA" and not self.ollama_host:
             st.error("Please enter the OLLAMA host URL.")
             return False
-        elif not self.db_url:
+        elif not os.getenv("PGVECTOR_DB_URL"):
             st.error("Please enter the PGVector DB URL.")
             return False
         logger.info("LLM configuration is valid")
@@ -518,12 +525,10 @@ class ChatApp:
     def get_pg_database(self, table_name):
         return PGDatabase(
             table_name=table_name,
-            db_url=self.db_url,
+            db_url=os.getenv("PGVECTOR_DB_URL"),
             ollama=self.ollama,
             ollama_host=self.ollama_host,
             openai_key=self.openai_key,
-            embedding_model=self.embedding_model,
-            completion_model=self.completion_model,
             rag=RAG(),
         )
 
@@ -596,11 +601,13 @@ class ChatApp:
                         return
             if st.session_state.isWebsiteAdded:
                 with st.chat_message("assistant"):
+                    st.session_state.is_block = True
                     logger.info(f"Generating response for prompt: {prompt}")
-                    with st.spinner(""):
-                        response = pg_vector.db.retrieve_and_generate_response(
-                            prompt, self.reterival_limit
-                        )
+                    # with st.spinner(""):
+                    response = pg_vector.db.retrieve_and_generate_response(
+                        prompt, self.reterival_limit
+                    )
+                    st.session_state.is_block = False
                     if response:
                         st.session_state.chat_with_website_history.append(
                             {"role": "assistant", "content": response}
@@ -612,9 +619,10 @@ class ChatApp:
 
     def handle_chat_with_file(self):
         st.title("Chat with File")
-        st.write("Upload a file to begin a conversation based on its content.")
 
         def handle_file_change():
+            # Clear the old chat history when a new file is uploaded
+            st.session_state.chat_with_file_history = []
             pg_vector = (
                 st.session_state.pg_vector if "pg_vector" in st.session_state else None
             )
@@ -627,9 +635,6 @@ class ChatApp:
 
         if uploaded_file is not None:
             logger.info(f"File uploaded: {uploaded_file.name} {uploaded_file.type}")
-
-            # Clear the old chat history when a new file is uploaded
-            st.session_state.chat_with_file_history = []
 
             file_content = StringIO(uploaded_file.getvalue().decode("utf-8")).read()
 
@@ -654,6 +659,7 @@ class ChatApp:
                     }
                 )
                 st.session_state.is_block = False
+
             logger.info("File content inserted into database")
 
             for msg in st.session_state.chat_with_file_history:
@@ -672,10 +678,12 @@ class ChatApp:
                     return
 
                 with st.chat_message("assistant"):
-                    with st.spinner(""):
-                        response = pg_vector.db.retrieve_and_generate_response(
-                            prompt, self.reterival_limit
-                        )
+                    st.session_state.is_block = True
+                    # with st.spinner(""):
+                    response = pg_vector.db.retrieve_and_generate_response(
+                        prompt, self.reterival_limit
+                    )
+                    st.session_state.is_block = False
                 if response:
                     st.session_state.chat_with_file_history.append(
                         {"role": "assistant", "content": response}
@@ -713,7 +721,8 @@ class ChatApp:
                 articles = pg_vector.fetch_articles_from_devto(prompt)
                 if articles:
                     for i, article in enumerate(articles):
-                        pg_vector.db.insert_data(article)
+                        if article:
+                            pg_vector.db.insert_data(article)
                         progress_bar.progress((i + 1) / len(articles))
                     progress_bar.empty()
                     progress_text.empty()
@@ -744,10 +753,12 @@ class ChatApp:
                     return
 
                 with st.chat_message("assistant"):
-                    with st.spinner(""):
-                        response = pg_vector.db.retrieve_and_generate_response(
-                            prompt, self.reterival_limit
-                        )
+                    # with st.spinner(""):
+                    st.session_state.is_block = True
+                    response = pg_vector.db.retrieve_and_generate_response(
+                        prompt, self.reterival_limit
+                    )
+                    st.session_state.is_block = False
                 if response:
                     st.session_state.chat_with_devto_history.append(
                         {"role": "assistant", "content": response}

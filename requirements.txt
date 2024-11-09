@@ -7,3 +7,4 @@ streamlit
 ollama
 llama-index
 llama-index-embeddings-ollama
+asyncio
