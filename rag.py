@@ -1,8 +1,8 @@
 import os, re, logging
 from enum import Enum
 from io import StringIO
-import asyncio
 
+import concurrent
 import psycopg2
 import requests
 import streamlit as st
@@ -30,6 +30,20 @@ class ChunkingMethods(Enum):
     MARKDOWN_SPLITTER = "MARKDOWN"
     TOKEN_SPLITTER = "TOKEN"
     SEMANTIC_SPLITTER = "SEMANTIC"
+
+
+class HNSWDistanceFunction(Enum):
+    COSINE_DISTANCE = "vector_cosine_ops"
+    INNER_PRODUCT = "vector_ip_ops"
+    L1_DISTANCE = "vector_l1_ops"
+    L2_DISTANCE = "vector_l2_ops"
+
+
+class HNSWDistanceSymbol(Enum):
+    COSINE_DISTANCE = "<=>"
+    INNER_PRODUCT = "<#>"
+    L1_DISTANCE = "<+>"
+    L2_DISTANCE = "<->"
 
 
 class RAG:
@@ -88,9 +102,6 @@ class PGDatabase:
         self.conn = self.connect_db(db_url)
         self.table_name = table_name
         self.embedding_table_name = f"embedding_{table_name}"
-        self.is_db_running_local = re.match(
-            r"^(http://)?(localhost|127\.0\.0\.\d{1,3})(:\d+)?(/.*)?$", db_url
-        )
         self.ollama = ollama
         self.ollama_host = ollama_host
         self.openai_key = openai_key
@@ -140,6 +151,16 @@ class PGDatabase:
             logger.info(f"Table {self.table_name} created successfully")
         except psycopg2.DatabaseError as e:
             logger.error(f"Error creating table: {e}")
+
+    def create_index(self):
+        try:
+            logger.info(f"Creating hnsw index on table {self.table_name}")
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    f"CREATE INDEX ON {self.table_name} USING hnsw (embedding {HNSWDistanceFunction[st.session_state.distance_function].value});"
+                )
+        except psycopg2.DatabaseError as e:
+            logger.error(f"Error creating index: {e}")
 
     def insert_data(self, data):
         try:
@@ -219,13 +240,14 @@ class PGDatabase:
                 query_embedding = self.get_query_embedding(query, cur)
                 cur.execute(
                     f"""
-                    SELECT title, content, 1 - (embedding <=> %s::vector) AS similarity
+                    SELECT title, content, 1 - (embedding {HNSWDistanceSymbol[st.session_state.distance_function].value} %s::vector) AS similarity
                     FROM {self.table_name}
                     ORDER BY similarity DESC
                     LIMIT %s;
                 """,
                     (query_embedding, limit),
                 )
+                
                 rows = cur.fetchall()
                 logger.info(f"Top {limit} similar rows: {rows}")
                 context = "\n\n".join(
@@ -237,27 +259,28 @@ class PGDatabase:
             logger.error(f"Error retrieving and generating response: {e}")
 
     def get_query_embedding(self, query, cur):
-        if not self.is_db_running_local:
-            return self.ollama.embeddings(
-                model=st.session_state.embedding_model, prompt=query
-            )["embedding"]
-        cur.execute(
-            f"SELECT ai.ollama_embed('{st.session_state.embedding_model}', %s);",
-            (query,),
-        )
-        return cur.fetchone()
+        if st.session_state.is_use_pgai == "yes":
+            cur.execute(
+                f"SELECT ai.ollama_embed('{st.session_state.embedding_model}', %s);",
+                (query,),
+            )
+            return cur.fetchone()
+
+        return self.ollama.embeddings(
+            model=st.session_state.embedding_model, prompt=query
+        )["embedding"]
 
     def generate_response(self, query, context, cur):
         prompt = f"Query: {query} \n Context: {context}"
 
-        if self.is_db_running_local:
+        if st.session_state.is_use_pgai == "yes":
             cur.execute(
                 f"SELECT ai.ollama_generate('{st.session_state.completion_model}', %s);",
                 (prompt,),
             )
-            response = cur.fetchone()["response"]
-            st.write(response)
-            return response
+            (response,) = cur.fetchone()
+            st.write(response["response"])
+            return response["response"]
 
         response_stream = self.ollama.chat(
             model=st.session_state.completion_model,
@@ -349,14 +372,13 @@ class PGVector:
                 )
                 articles_data = []
 
-                async def fetch_article_data(article_url):
-                    return self.fetch_data_from_website(article_url)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                    future_to_url = {executor.submit(self.fetch_data_from_website, article["url"]): article for article in articles}
+                    for future in concurrent.futures.as_completed(future_to_url):
+                        article_data = future.result()
+                        if article_data:
+                            articles_data.append(article_data)
 
-                async def fetch_all_articles():
-                    tasks = [fetch_article_data(article["url"]) for article in articles]
-                    return await asyncio.gather(*tasks)
-
-                articles_data = asyncio.run(fetch_all_articles())
                 return articles_data
         except requests.RequestException as e:
             logger.error(f"Error fetching articles from dev.to: {e}")
@@ -369,9 +391,18 @@ class ChatApp:
             "Chat Mode",
             ["Chat with Website", "Chat with File", "Chat with your Dev.to articles"],
         )
-        # self.db_url = st.sidebar.text_input("PGVector DB URL")
 
         self.llm_choice = st.sidebar.selectbox("LLM Provider", ["OLLAMA", "OPENAI"])
+
+        if self.llm_choice != "OPENAI":
+            st.session_state.is_use_pgai = st.sidebar.selectbox(
+                "Use PGVector Vectorizer?",
+                ["yes", "no"],
+            )
+            if st.session_state.is_use_pgai == "yes":
+                if "pg_vector" in st.session_state:
+                    pg_vector = st.session_state.pg_vector
+                    pg_vector.db.set_ollama_config()
 
         st.session_state.embedding_model = self.get_embedding_model()
         st.session_state.completion_model = self.get_completion_model()
@@ -413,6 +444,22 @@ class ChatApp:
             value=st.session_state.reterival_limit,
             max_value=10,
         )
+
+        st.session_state.use_hnsw = st.sidebar.selectbox(
+            "Use HNSW for indexing?",
+            ["no", "yes"],
+        )
+
+        if st.session_state.use_hnsw == "yes":
+            if "pg_vector" in st.session_state:
+                pg_vector = st.session_state.pg_vector
+                pg_vector.db.create_index()
+
+        st.session_state.distance_function = st.sidebar.selectbox(
+            "Distance Function",
+            [distance_function.name for distance_function in HNSWDistanceFunction],
+        )
+
         self.initialize_session_state()
 
         if st.sidebar.button("Clear All Data in DB"):
@@ -420,7 +467,6 @@ class ChatApp:
 
     def get_embedding_model(self):
         if self.llm_choice == "OpenAI":
-            # if provider change we need start again because  openAI using different indexing technique
             self.clear_all_data()
             return st.sidebar.selectbox(
                 "Embedding Model",
@@ -542,7 +588,7 @@ class ChatApp:
         for msg in st.session_state.chat_with_website_history:
             st.chat_message(msg["role"]).write(msg["content"])
 
-        if prompt := st.chat_input(disabled=st.session_state.get("is_block", False)):
+        if prompt := st.chat_input():
             st.session_state.chat_with_website_history.append(
                 {"role": "user", "content": prompt}
             )
@@ -601,9 +647,9 @@ class ChatApp:
                         return
             if st.session_state.isWebsiteAdded:
                 with st.chat_message("assistant"):
+                    st.write("")
                     st.session_state.is_block = True
                     logger.info(f"Generating response for prompt: {prompt}")
-                    # with st.spinner(""):
                     response = pg_vector.db.retrieve_and_generate_response(
                         prompt, self.reterival_limit
                     )
@@ -621,7 +667,6 @@ class ChatApp:
         st.title("Chat with File")
 
         def handle_file_change():
-            # Clear the old chat history when a new file is uploaded
             st.session_state.chat_with_file_history = []
             pg_vector = (
                 st.session_state.pg_vector if "pg_vector" in st.session_state else None
@@ -665,9 +710,7 @@ class ChatApp:
             for msg in st.session_state.chat_with_file_history:
                 st.chat_message(msg["role"]).write(msg["content"])
 
-            if prompt := st.chat_input(
-                disabled=st.session_state.get("is_block", False)
-            ):
+            if prompt := st.chat_input():
                 st.session_state.chat_with_file_history.append(
                     {"role": "user", "content": prompt}
                 )
@@ -678,8 +721,8 @@ class ChatApp:
                     return
 
                 with st.chat_message("assistant"):
+                    st.write("")
                     st.session_state.is_block = True
-                    # with st.spinner(""):
                     response = pg_vector.db.retrieve_and_generate_response(
                         prompt, self.reterival_limit
                     )
@@ -697,9 +740,7 @@ class ChatApp:
 
         for msg in st.session_state.chat_with_devto_history:
             st.chat_message(msg["role"]).write(msg["content"])
-        if prompt := st.chat_input(
-            key="chat_with_dev_to", disabled=st.session_state.get("is_block", False)
-        ):
+        if prompt := st.chat_input(key="chat_with_dev_to"):
             if not st.session_state.devto_username:
                 st.session_state.chat_with_devto_history.append(
                     {"role": "user", "content": prompt}
@@ -726,9 +767,9 @@ class ChatApp:
                         progress_bar.progress((i + 1) / len(articles))
                     progress_bar.empty()
                     progress_text.empty()
-                    st.write(
-                        "Articles fetched and indexed successfully! You can now start chatting with your articles."
-                    )
+                    
+                    st.success("Articles fetched and indexed successfully! You can now start chatting with your articles.")
+                    
                     st.session_state.is_block = False
                     st.session_state.devto_username = prompt
                 else:
@@ -753,7 +794,7 @@ class ChatApp:
                     return
 
                 with st.chat_message("assistant"):
-                    # with st.spinner(""):
+                    st.write("")
                     st.session_state.is_block = True
                     response = pg_vector.db.retrieve_and_generate_response(
                         prompt, self.reterival_limit
