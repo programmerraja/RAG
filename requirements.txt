@@ -6,4 +6,4 @@ psycopg2
 streamlit
 ollama
 llama-index
-llama_index.embeddings
+llama-index-embeddings-ollama
