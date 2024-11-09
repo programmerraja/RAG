@@ -25,9 +25,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# def lateChunking(text)
-
-
 class ChunkingMethods(Enum):
     SENTENCE_SPLITTER = "SENTENCE"
     MARKDOWN_SPLITTER = "MARKDOWN"
@@ -238,7 +235,6 @@ class PGDatabase:
                     [f"Title: {row[0]}\n Content: {row[1]}" for row in rows]
                 )
                 response = self.generate_response(query, context, cur)
-                # logger.info(f"Generated response: {response}")
                 return response
         except psycopg2.DatabaseError as e:
             logger.error(f"Error retrieving and generating response: {e}")
@@ -400,7 +396,6 @@ class ChatApp:
             self.openai_key = st.sidebar.text_input("Enter OpenAI Key", type="password")
         elif self.llm_choice == "OLLAMA":
             self.ollama_host = st.sidebar.text_input("Enter OLLAMA Host URL")
-            print(self.ollama_host,"ollam")
             self.ollama = Client(host=self.ollama_host)
             st.session_state.ollama_host = self.ollama_host
             self.initialize_chunking_settings()
@@ -603,7 +598,6 @@ class ChatApp:
                         st.session_state.is_block = False
 
                         return
-            print("isWebsiteAdded", st.session_state.isWebsiteAdded)
             if st.session_state.isWebsiteAdded:
                 with st.chat_message("assistant"):
                     logger.info(f"Generating response for prompt: {prompt}")
