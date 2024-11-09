@@ -1,19 +1,20 @@
 import logging
-import random
 import re
 from enum import Enum
 from io import StringIO
-import time
 
-from bs4 import BeautifulSoup
 import psycopg2
 import requests
 import streamlit as st
 
-from langchain.text_splitter import (
-    MarkdownTextSplitter,
-    CharacterTextSplitter,
-    NLTKTextSplitter,
+from llama_index.core import Document
+from llama_index.embeddings.ollama import OllamaEmbedding
+
+from llama_index.core.node_parser import (
+    MarkdownNodeParser,
+    SentenceSplitter,
+    TokenTextSplitter,
+    SemanticSplitterNodeParser,
 )
 
 from ollama import Client
@@ -24,38 +25,56 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# def lateChunking(text)
+
+
 class ChunkingMethods(Enum):
-    CHARACTER_SPLITTER = "CHARACTER"
+    SENTENCE_SPLITTER = "SENTENCE"
     MARKDOWN_SPLITTER = "MARKDOWN"
     TOKEN_SPLITTER = "TOKEN"
+    SEMANTIC_SPLITTER = "SEMANTIC"
 
 
 class RAG:
-    def __init__(
-        self,
-        chunk_size=2000,
-        chunk_overlap=20,
-        chunking_method=ChunkingMethods.MARKDOWN_SPLITTER.value,
-    ):
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.chunking_method = chunking_method
+    def __init__(self):
+        pass
 
     def chunking(self, data):
-        logger.info(f"Chunking data using method: {self.chunking_method}")
-        splitter_classes = {
-            ChunkingMethods.MARKDOWN_SPLITTER.value: MarkdownTextSplitter,
-            ChunkingMethods.CHARACTER_SPLITTER.value: CharacterTextSplitter,
-            ChunkingMethods.TOKEN_SPLITTER.value: NLTKTextSplitter,
-        }
-        splitter_class = splitter_classes.get(self.chunking_method)
-        if splitter_class:
-            text_splitter = splitter_class(
-                chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap
-            )
-            return text_splitter.create_documents([data])
+        chunk_size = st.session_state.chunk_size
+        chunk_overlap = st.session_state.chunk_overlap
+        chunking_method = st.session_state.chunking_method
+        ollama_host = st.session_state.ollama_host
+        embedding_model = st.session_state.embedding_model
 
-        logger.error(f"Invalid chunking method: {self.chunking_method}")
+        logger.info(f"Chunking data using method: {chunking_method}")
+
+        splitter_classes = {
+            ChunkingMethods.MARKDOWN_SPLITTER.value: MarkdownNodeParser,
+            ChunkingMethods.SENTENCE_SPLITTER.value: SentenceSplitter,
+            ChunkingMethods.TOKEN_SPLITTER.value: TokenTextSplitter,
+            ChunkingMethods.SEMANTIC_SPLITTER.value: SemanticSplitterNodeParser,
+        }
+        splitter_class = splitter_classes.get(chunking_method)
+
+        if splitter_class:
+            if splitter_class == SemanticSplitterNodeParser:
+                embed_model = OllamaEmbedding(
+                    model_name=embedding_model,
+                    base_url=ollama_host,
+                    ollama_additional_kwargs={"mirostat": 0},
+                )
+                text_splitter = splitter_class(
+                    embed_model=embed_model,
+                    buffer_size=1,
+                    breakpoint_percentile_threshold=95,
+                )
+            else:
+                text_splitter = splitter_class(
+                    chunk_size=chunk_size, chunk_overlap=chunk_overlap
+                )
+            return text_splitter.get_nodes_from_documents([Document(text=data)])
+
+        logger.error(f"Invalid chunking method: {chunking_method}")
         return []
 
 
@@ -74,7 +93,9 @@ class PGDatabase:
         self.conn = self.connect_db(db_url)
         self.table_name = table_name
         self.embedding_table_name = f"embedding_{table_name}"
-        self.is_db_running_local = False
+        self.is_db_running_local = re.match(
+            r"^(http://)?(localhost|127\.0\.0\.\d{1,3})(:\d+)?(/.*)?$", db_url
+        )
         self.ollama = ollama
         self.ollama_host = ollama_host
         self.openai_key = openai_key
@@ -146,7 +167,7 @@ class PGDatabase:
                     logger.info(f"Split content into {len(docs)} chunks")
                     for doc in docs:
                         data["embedding"] = self.ollama.embeddings(
-                            model=self.embedding_model, prompt=doc.page_content
+                            model=self.embedding_model, prompt=doc.get_content()
                         )["embedding"]
 
                         cur.execute(
@@ -349,6 +370,7 @@ class ChatApp:
         self.llm_choice = st.sidebar.selectbox("Select LLM", ["OpenAI", "OLLAMA"])
 
         self.embedding_model = self.get_embedding_model()
+        st.session_state.embedding_model = self.embedding_model
         self.completion_model = self.get_completion_model()
         self.openai_key = None
         self.ollama_host = None
@@ -380,6 +402,7 @@ class ChatApp:
             self.ollama_host = st.sidebar.text_input("Enter OLLAMA Host URL")
             print(self.ollama_host,"ollam")
             self.ollama = Client(host=self.ollama_host)
+            st.session_state.ollama_host = self.ollama_host
             self.initialize_chunking_settings()
 
         st.session_state.reterival_limit = st.session_state.get("reterival_limit", 3)
@@ -401,7 +424,10 @@ class ChatApp:
                 ["text-embedding-3-small", "text-embedding-3-large"],
             )
         elif self.llm_choice == "OLLAMA":
-            return st.sidebar.selectbox("Select Embedding Model", ["nomic-embed-text"])
+            return st.sidebar.selectbox(
+                "Select Embedding Model",
+                ["nomic-embed-text", "jina-embeddings-v2-base-en"],
+            )
 
     def get_completion_model(self):
         if self.llm_choice == "OLLAMA":
@@ -421,31 +447,26 @@ class ChatApp:
             min_value=100,
             value=st.session_state.chunk_size,
             max_value=10000,
-            on_change=self.update_chunk_size,
         )
+
+        st.session_state.chunk_size = self.chunk_size
+
         self.chunk_overlap = st.sidebar.number_input(
             "Set chunk overlap",
             min_value=0,
             value=st.session_state.chunk_overlap,
             max_value=100,
-            on_change=self.update_chunk_overlap,
         )
+
+        st.session_state.chunk_overlap = self.chunk_overlap
+
         self.chunking_method = st.sidebar.selectbox(
             "Select chunking method",
             [method.value for method in ChunkingMethods],
             index=[method.value for method in ChunkingMethods].index(
                 st.session_state.chunking_method
             ),
-            on_change=self.update_chunking_method,
         )
-
-    def update_chunk_size(self):
-        st.session_state.chunk_size = self.chunk_size
-
-    def update_chunk_overlap(self):
-        st.session_state.chunk_overlap = self.chunk_overlap
-
-    def update_chunking_method(self):
         st.session_state.chunking_method = self.chunking_method
 
     def initialize_session_state(self):
@@ -503,6 +524,18 @@ class ChatApp:
 
         st.success("All data cleared successfully.")
 
+    def get_pg_database(self, table_name):
+        return PGDatabase(
+            table_name=table_name,
+            db_url=self.db_url,
+            ollama=self.ollama,
+            ollama_host=self.ollama_host,
+            openai_key=self.openai_key,
+            embedding_model=self.embedding_model,
+            completion_model=self.completion_model,
+            rag=RAG(),
+        )
+
     def handle_chat_with_website(self):
         st.title("Chat with website")
         url_pattern = re.compile(r"^(https?://)")
@@ -523,16 +556,7 @@ class ChatApp:
                 return
 
             if "pg_vector" not in st.session_state:
-                pg_database = PGDatabase(
-                    table_name="chat_with_website",
-                    db_url=self.db_url,
-                    ollama=self.ollama,
-                    ollama_host=self.ollama_host,
-                    openai_key=self.openai_key,
-                    embedding_model=self.embedding_model,
-                    completion_model=self.completion_model,
-                    rag=RAG(self.chunk_size, self.chunk_overlap, self.chunking_method),
-                )
+                pg_database = self.get_pg_database("chat_with_website")
                 st.session_state.pg_vector = PGVector(pg_database)
             pg_vector = st.session_state.pg_vector
 
@@ -600,7 +624,16 @@ class ChatApp:
         st.title("Chat with File")
         st.write("Upload a file to begin a conversation based on its content.")
 
-        uploaded_file = st.file_uploader("Choose a file", type=["txt", "md"])
+        def handle_file_change():
+            pg_vector = (
+                st.session_state.pg_vector if "pg_vector" in st.session_state else None
+            )
+            if pg_vector:
+                pg_vector.db.clean_table()
+
+        uploaded_file = st.file_uploader(
+            "Choose a file", type=["txt", "md"], on_change=handle_file_change
+        )
 
         if uploaded_file is not None:
             logger.info(f"File uploaded: {uploaded_file.name} {uploaded_file.type}")
@@ -617,16 +650,7 @@ class ChatApp:
                 return
 
             if "pg_vector" not in st.session_state:
-                pg_database = PGDatabase(
-                    table_name="chat_with_file",
-                    db_url=self.db_url,
-                    ollama=self.ollama,
-                    ollama_host=self.ollama_host,
-                    openai_key=self.openai_key,
-                    embedding_model=self.embedding_model,
-                    completion_model=self.completion_model,
-                    rag=RAG(self.chunk_size, self.chunk_overlap, self.chunking_method),
-                )
+                pg_database = self.get_pg_database("chat_with_file")
                 st.session_state.pg_vector = PGVector(pg_database)
             pg_vector = st.session_state.pg_vector
 
@@ -672,9 +696,6 @@ class ChatApp:
 
     def handle_chat_with_devto(self):
         st.title("Chat with your Dev.to articles")
-        st.write(
-            "Enter a dev.to username to begin a conversation based on their articles."
-        )
 
         for msg in st.session_state.chat_with_devto_history:
             st.chat_message(msg["role"]).write(msg["content"])
@@ -691,18 +712,7 @@ class ChatApp:
                     return
                 st.session_state.is_block = True
                 if "pg_vector" not in st.session_state:
-                    pg_database = PGDatabase(
-                        table_name="chat_with_devto",
-                        db_url=self.db_url,
-                        ollama=self.ollama,
-                        ollama_host=self.ollama_host,
-                        openai_key=self.openai_key,
-                        embedding_model=self.embedding_model,
-                        completion_model=self.completion_model,
-                        rag=RAG(
-                            self.chunk_size, self.chunk_overlap, self.chunking_method
-                        ),
-                    )
+                    pg_database = self.get_pg_database("chat_with_devto")
                     st.session_state.pg_vector = PGVector(pg_database)
 
                 pg_vector = st.session_state.pg_vector
@@ -768,8 +778,3 @@ class ChatApp:
 if __name__ == "__main__":
     chat_app = ChatApp()
     chat_app.run()
-
-
-# TODO
-# search with keyword etc
-# stuffbreaker
