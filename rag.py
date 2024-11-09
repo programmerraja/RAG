@@ -428,7 +428,7 @@ class ChatApp:
             else st.session_state.get("isWebsiteAdded")
         )
 
-        if self.llm_choice == "OpenAI":
+        if self.llm_choice == "OPENAI":
             self.openai_key = st.sidebar.text_input("OpenAI Key", type="password")
         elif self.llm_choice == "OLLAMA":
             self.ollama_host = st.sidebar.text_input("OLLAMA Host URL", type="password")
@@ -466,7 +466,7 @@ class ChatApp:
             self.clear_all_data()
 
     def get_embedding_model(self):
-        if self.llm_choice == "OpenAI":
+        if self.llm_choice == "OPENAI":
             self.clear_all_data()
             return st.sidebar.selectbox(
                 "Embedding Model",
@@ -533,7 +533,7 @@ class ChatApp:
 
     def check_llm_config(self):
         logger.info("Checking LLM configuration")
-        if self.llm_choice == "OpenAI" and not self.openai_key:
+        if self.llm_choice == "OPENAI" and not self.openai_key:
             st.error("Please enter the OpenAI key.")
             return False
         elif self.llm_choice == "OLLAMA" and not self.ollama_host:
