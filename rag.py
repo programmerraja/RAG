@@ -646,8 +646,8 @@ class ChatApp:
 
                         return
             if st.session_state.isWebsiteAdded:
+                st.write("",end="")
                 with st.chat_message("assistant"):
-                    st.write("")
                     st.session_state.is_block = True
                     logger.info(f"Generating response for prompt: {prompt}")
                     response = pg_vector.db.retrieve_and_generate_response(
@@ -720,8 +720,8 @@ class ChatApp:
                     self.clear_all_data()
                     return
 
+                st.write("",end="")
                 with st.chat_message("assistant"):
-                    st.write("")
                     st.session_state.is_block = True
                     response = pg_vector.db.retrieve_and_generate_response(
                         prompt, self.reterival_limit
@@ -793,8 +793,8 @@ class ChatApp:
                     self.clear_all_data()
                     return
 
+                st.write("",end="")
                 with st.chat_message("assistant"):
-                    st.write("")
                     st.session_state.is_block = True
                     response = pg_vector.db.retrieve_and_generate_response(
                         prompt, self.reterival_limit
