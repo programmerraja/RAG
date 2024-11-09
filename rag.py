@@ -105,7 +105,7 @@ class PGDatabase:
 
     def connect_db(self, db_url):
         try:
-            logger.info("Connecting to database")
+            logger.info("Connecting to the database")
             conn = psycopg2.connect(db_url)
             logger.info("Database connection established")
             return conn
@@ -115,7 +115,7 @@ class PGDatabase:
 
     def set_ollama_config(self):
         try:
-            logger.info("Setting Ollama configuration")
+            logger.info("Configuring Ollama settings")
             with self.conn.cursor() as cur:
                 cur.execute(
                     "SELECT set_config('ai.ollama_host', %s, false);",
@@ -124,11 +124,11 @@ class PGDatabase:
                 self.conn.commit()
             logger.info("Ollama configuration set successfully")
         except psycopg2.DatabaseError as e:
-            logger.error(f"Error setting Ollama config: {e}")
+            logger.error(f"Error setting Ollama configuration: {e}")
 
     def create_table(self):
         try:
-            logger.info(f"Creating table {self.table_name} if not exists")
+            logger.info(f"Creating table {self.table_name} if it does not exist")
             with self.conn.cursor() as cur:
                 table_creation_query = f"""
                     CREATE TABLE IF NOT EXISTS {self.table_name} (
@@ -358,12 +358,12 @@ class PGVector:
 class ChatApp:
     def __init__(self):
         self.chat_mode = st.sidebar.selectbox(
-            "Select Chat Mode",
+            "Chat Mode",
             ["Chat with Website", "Chat with File", "Chat with your Dev.to articles"],
         )
-        self.db_url = st.sidebar.text_input("Enter PGVector DB URL")
+        self.db_url = st.sidebar.text_input("PGVector DB URL")
 
-        self.llm_choice = st.sidebar.selectbox("Select LLM", ["OpenAI", "OLLAMA"])
+        self.llm_choice = st.sidebar.selectbox("LLM Provider", ["OpenAI", "OLLAMA"])
 
         self.embedding_model = self.get_embedding_model()
         st.session_state.embedding_model = self.embedding_model
@@ -393,41 +393,42 @@ class ChatApp:
         self.is_block = st.session_state.is_block
 
         if self.llm_choice == "OpenAI":
-            self.openai_key = st.sidebar.text_input("Enter OpenAI Key", type="password")
+            self.openai_key = st.sidebar.text_input("OpenAI Key", type="password")
         elif self.llm_choice == "OLLAMA":
-            self.ollama_host = st.sidebar.text_input("Enter OLLAMA Host URL")
+            self.ollama_host = st.sidebar.text_input("OLLAMA Host URL")
             self.ollama = Client(host=self.ollama_host)
             st.session_state.ollama_host = self.ollama_host
             self.initialize_chunking_settings()
 
         st.session_state.reterival_limit = st.session_state.get("reterival_limit", 3)
+        
         self.reterival_limit = st.sidebar.number_input(
-            "Set number of doc to retrieve",
+            "Number of documents to retrieve",
             min_value=1,
             value=st.session_state.reterival_limit,
             max_value=10,
         )
         self.initialize_session_state()
 
-        if st.sidebar.button("Clear All Data IN DB"):
+        if st.sidebar.button("Clear All Data in DB"):
             self.clear_all_data()
 
     def get_embedding_model(self):
         if self.llm_choice == "OpenAI":
             return st.sidebar.selectbox(
-                "Select Embedding Model",
+                "Embedding Model",
                 ["text-embedding-3-small", "text-embedding-3-large"],
             )
         elif self.llm_choice == "OLLAMA":
             return st.sidebar.selectbox(
-                "Select Embedding Model",
+                "Embedding Model",
                 ["nomic-embed-text", "jina-embeddings-v2-base-en"],
             )
 
     def get_completion_model(self):
         if self.llm_choice == "OLLAMA":
             return st.sidebar.selectbox(
-                "Select Completion Model", ["tinyllama", "llama3", "mistral", "phi3.5"]
+                "Completion Model", ["tinyllama", "llama3", "mistral", "phi3.5"]
             )
 
     def initialize_chunking_settings(self):
@@ -437,39 +438,34 @@ class ChatApp:
             "chunking_method", ChunkingMethods.MARKDOWN_SPLITTER.value
         )
 
-        self.chunk_size = st.sidebar.number_input(
-            "Set chunk size",
+        st.session_state.chunk_size = st.sidebar.number_input(
+            "Chunk size",
             min_value=100,
             value=st.session_state.chunk_size,
             max_value=10000,
         )
 
-        st.session_state.chunk_size = self.chunk_size
-
-        self.chunk_overlap = st.sidebar.number_input(
-            "Set chunk overlap",
+        st.session_state.chunk_overlap = st.sidebar.number_input(
+            "Chunk overlap",
             min_value=0,
             value=st.session_state.chunk_overlap,
             max_value=100,
         )
 
-        st.session_state.chunk_overlap = self.chunk_overlap
-
-        self.chunking_method = st.sidebar.selectbox(
-            "Select chunking method",
+        st.session_state.chunking_method = st.sidebar.selectbox(
+            "Chunking method",
             [method.value for method in ChunkingMethods],
             index=[method.value for method in ChunkingMethods].index(
                 st.session_state.chunking_method
             ),
         )
-        st.session_state.chunking_method = self.chunking_method
 
     def initialize_session_state(self):
         if "chat_with_website_history" not in st.session_state:
             st.session_state.chat_with_website_history = [
                 {
                     "role": "assistant",
-                    "content": "Please provide a website link to start the chat with it.",
+                    "content": "Please provide a website link to start the chat.",
                 }
             ]
         if "chat_with_file_history" not in st.session_state:
@@ -485,13 +481,13 @@ class ChatApp:
     def check_llm_config(self):
         logger.info("Checking LLM configuration")
         if self.llm_choice == "OpenAI" and not self.openai_key:
-            st.error("Please enter the OpenAI key")
+            st.error("Please enter the OpenAI key.")
             return False
         elif self.llm_choice == "OLLAMA" and not self.ollama_host:
-            st.error("Please enter the OLLAMA host URL")
+            st.error("Please enter the OLLAMA host URL.")
             return False
         elif not self.db_url:
-            st.error("Please enter the PGVector DB URL")
+            st.error("Please enter the PGVector DB URL.")
             return False
         logger.info("LLM configuration is valid")
         return True
@@ -502,7 +498,7 @@ class ChatApp:
         st.session_state.chat_with_website_history = [
             {
                 "role": "assistant",
-                "content": "Please provide a website link to start the chat with it.",
+                "content": "Please provide a website link to start the chat.",
             }
         ]
         st.session_state.chat_with_file_history = []
@@ -532,7 +528,7 @@ class ChatApp:
         )
 
     def handle_chat_with_website(self):
-        st.title("Chat with website")
+        st.title("Chat with Website")
         url_pattern = re.compile(r"^(https?://)")
         youtube_pattern = re.compile(r"(https?://)?(www\.)?(youtube|youtu\.be)")
 
@@ -611,7 +607,7 @@ class ChatApp:
                         )
             else:
                 st.chat_message("assistant").write(
-                    "Please provide a website link with protocol (https://.. or http://) to start the chat with it."
+                    "Please provide a website link with protocol (https://.. or http://) to start the chat."
                 )
 
     def handle_chat_with_file(self):
@@ -722,7 +718,7 @@ class ChatApp:
                     progress_bar.empty()
                     progress_text.empty()
                     st.write(
-                        "Articles fetched and indexed successfully! you can start chating with your articel"
+                        "Articles fetched and indexed successfully! You can now start chatting with your articles."
                     )
                     st.session_state.is_block = False
                     st.session_state.devto_username = prompt
@@ -730,7 +726,7 @@ class ChatApp:
                     progress_bar.empty()
                     progress_text.empty()
                     st.write(
-                        "Unable to fetch articles for the provided valid username. or no articles found"
+                        "Unable to fetch articles for the provided username or no articles found."
                     )
                     st.session_state.is_block = False
                     return
