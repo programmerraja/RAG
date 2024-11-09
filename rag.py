@@ -783,6 +783,10 @@ class ChatApp:
                 st.session_state.is_block = False
 
             elif st.session_state.devto_username:
+                
+                if not self.check_llm_config():
+                    return
+                
                 pg_vector = st.session_state.pg_vector
                 st.session_state.chat_with_devto_history.append(
                     {"role": "user", "content": prompt}
