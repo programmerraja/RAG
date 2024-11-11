@@ -533,12 +533,19 @@ class ChatApp:
 
     def check_llm_config(self):
         logger.info("Checking LLM configuration")
-        if self.llm_choice == "OPENAI" and not self.openai_key:
-            st.error("Please enter the OpenAI key.")
-            return False
-        elif self.llm_choice == "OLLAMA" and not self.ollama_host:
-            st.error("Please enter the OLLAMA host URL.")
-            return False
+        url_pattern = re.compile(r"^(http?://)")
+
+        if self.llm_choice == "OPENAI":
+            if not self.openai_key:
+                st.error("Please enter the OpenAI key.")
+                return False
+        elif self.llm_choice == "OLLAMA":
+            if not self.ollama_host:
+                st.error("Please enter the OLLAMA host URL.")
+                return False
+            elif not url_pattern.match(self.ollama_host):
+                st.error("OLLAMA host URL is not in a valid format.")
+                return False
         elif not os.getenv("PGVECTOR_DB_URL"):
             st.error("Please enter the PGVector DB URL.")
             return False
