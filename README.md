@@ -44,3 +44,19 @@ This project is licensed under the MIT License.
 ## Contributing
 Contributions are welcome! Please open an issue or submit a pull request.
 
+
+
+## Misc
+
+to install psycopg2 on ubuntu 
+
+if you issue refer https://stackoverflow.com/questions/11618898/pg-config-executable-not-found
+
+sudo apt-get install libpq-dev python-dev
+
+pip install psycopg2-binary
+
+
+sudo OLLAMA_HOST="0.0.0.0" ollama serve
+
+
